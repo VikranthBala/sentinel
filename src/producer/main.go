@@ -94,7 +94,7 @@ func generateTransaction() Transaction {
 
 	// INJECT FRAUD: Every 50th transaction is an outlier
 	if rand.Intn(50) == 0 {
-		amount = amount * 50 // Sudden spike! e.g., $5000.00
+		amount = amount * 100 // Sudden spike! e.g., $5000.00
 		fmt.Print("⚠️  INJECTING FRAUDULENT PATTERN \n")
 	}
 
