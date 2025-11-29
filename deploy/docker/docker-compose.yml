@@ -51,6 +51,8 @@ services:
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     networks:
       - sentinel-net
+    volumes:
+      - ./../../src/processor:/opt/spark-app
 
   spark-worker:
     image: apache/spark:3.5.0
