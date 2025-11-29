@@ -1,0 +1,30 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# --- Golang ---
+/src/producer/bin/
+/src/producer/vendor/
+*.exe
+*.test
+
+# --- Spark/Java ---
+*.class
+*.jar
+.gradle/
+build/
+target/
+spark-warehouse/
+metastore_db/
+checkpoint/
+
+# --- IDEs ---
+.vscode/
+.idea/
+
+# --- OS & Data ---
+.DS_Store
+*.log
+/data/*
