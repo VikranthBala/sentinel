@@ -1,0 +1,97 @@
+networks:
+  sentinel-net:
+    driver: bridge
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. MESSAGING LAYER (Confluent Platform)
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: sentinel-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - sentinel-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: sentinel-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      # Allow connection from inside docker (kafka:29092) and outside (localhost:9092)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    networks:
+      - sentinel-net
+
+  # ---------------------------------------------------------------------------
+  # 2. PROCESSING LAYER (Official Apache Spark)
+  # ---------------------------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: sentinel-spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    ports:
+      - '8080:8080'
+      - '7077:7077'
+    # Override default command to run Master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    networks:
+      - sentinel-net
+
+  spark-worker:
+    image: apache/spark:3.5.0
+    container_name: sentinel-spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=1
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    depends_on:
+      - spark-master
+    # Override default command to run Worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    networks:
+      - sentinel-net
+
+  # ---------------------------------------------------------------------------
+  # 3. STORAGE LAYER (Official Images)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: sentinel-db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: fraud_detection_db
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - sentinel-net
+
+  redis:
+    image: redis:alpine
+    container_name: sentinel-redis
+    ports:
+      - '6379:6379'
+    networks:
+      - sentinel-net
+
+volumes:
+  postgres_data:
