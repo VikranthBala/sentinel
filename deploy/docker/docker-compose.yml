@@ -44,6 +44,10 @@ services:
     environment:
       - SPARK_MODE=master
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      # R2 Credentials - IMPORTANT: Set these in .env file
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_ENDPOINT=${S3_ENDPOINT}
     ports:
       - '8080:8080'
       - '7077:7077'
@@ -53,6 +57,7 @@ services:
       - sentinel-net
     volumes:
       - ./../../src/processor:/opt/spark-app
+      - spark-checkpoints:/tmp/spark-checkpoints  # For fault tolerance
 
   spark-worker:
     image: apache/spark:3.5.0
@@ -63,12 +68,18 @@ services:
       - SPARK_WORKER_MEMORY=1G
       - SPARK_WORKER_CORES=1
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      # R2 Credentials
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_ENDPOINT=${S3_ENDPOINT}
     depends_on:
       - spark-master
     # Override default command to run Worker
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     networks:
       - sentinel-net
+    volumes:
+      - spark-checkpoints:/tmp/spark-checkpoints
 
   # ---------------------------------------------------------------------------
   # 3. STORAGE LAYER (Official Images)
@@ -97,3 +108,4 @@ services:
 
 volumes:
   postgres_data:
+  spark-checkpoints:  # New volume for checkpointing
