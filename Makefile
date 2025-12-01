@@ -47,20 +47,7 @@ db-shell: ## Connect to the Postgres shell inside Docker
 
 db-init: ## Initialize database tables
 	@echo "🗄️  Initializing database schema..."
-	docker exec -it $(DB_CONTAINER) psql -U admin -d fraud_detection_db -c "\
-		CREATE TABLE IF NOT EXISTS fraud_alerts ( \
-			id SERIAL PRIMARY KEY, \
-			transaction_id VARCHAR(100), \
-			user_id INTEGER, \
-			amount FLOAT, \
-			timestamp TIMESTAMP \
-		); \
-		CREATE TABLE IF NOT EXISTS user_stats ( \
-			user_id INTEGER, \
-			avg_spend FLOAT, \
-			txn_count INTEGER, \
-			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP \
-		);"
+	docker exec -i $(DB_CONTAINER) psql -U admin -d fraud_detection_db < setup.sql
 	@echo "✅ Database initialized"
 
 # --- RUNNING COMPONENTS ---
@@ -77,7 +64,7 @@ submit: ## Submit the Spark Streaming Job with R2 support
 		--conf spark.hadoop.fs.s3a.path.style.access=true \
 		--conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
 		--conf spark.hadoop.fs.s3a.connection.ssl.enabled=true \
-		/opt/spark-app/job.py
+		/opt/spark-app/job.py --pipeline-id 1
 
 producer: ## Run the Golang Transaction Producer
 	@echo "💸 Starting Transaction Generator..."
