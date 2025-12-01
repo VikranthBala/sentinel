@@ -27,6 +27,11 @@ class Pipeline(BaseModel):
     kafka_topic: str
     schema: list[SchemaField]
 
+class Rule(BaseModel):
+    rule_expression: str
+    severity: str = "warning"
+    description: str
+
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
@@ -72,3 +77,21 @@ def get_schema(id: int):
         raise HTTPException(status_code=404, detail="Pipeline or Schema not found")
         
     return result['schema_json']
+
+@app.post("/api/pipelines/{id}/rules")
+def add_rule(id: int, rule: Rule):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO rules (pipeline_id, rule_expression, severity, description) VALUES (%s, %s, %s, %s) RETURNING id",
+            (id, rule.rule_expression, rule.severity, rule.description)
+        )
+        rule_id = cursor.fetchone()[0]
+        conn.commit()
+        return {"id": rule_id, "status": "Rule added"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()

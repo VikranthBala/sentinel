@@ -1,10 +1,8 @@
-CREATE TABLE IF NOT EXISTS fraud_alerts ( 
-    id SERIAL PRIMARY KEY, 
-    transaction_id VARCHAR(100), 
-    user_id INTEGER, 
-    amount FLOAT, 
-    timestamp TIMESTAMP 
-); 
+DROP TABLE IF EXISTS fraud_alerts; 
+DROP TABLE IF EXISTS rules; 
+DROP TABLE IF EXISTS schemas; 
+DROP TABLE IF EXISTS pipelines; 
+
 CREATE TABLE IF NOT EXISTS user_stats (
     user_id INTEGER,
     avg_spend FLOAT,
@@ -32,4 +30,12 @@ CREATE TABLE rules (
     severity VARCHAR(50) DEFAULT 'warning',
     description TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE fraud_alerts (
+    id SERIAL PRIMARY KEY,
+    pipeline_id INTEGER REFERENCES pipelines(id),  -- Links back to the config
+    severity VARCHAR(50),                          -- critical, warning, etc.
+    rule_description TEXT,                         -- "Amount > 5000"
+    alert_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    transaction_data JSONB NOT NULL                -- ⭐️ The Dynamic Payload
 );

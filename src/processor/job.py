@@ -4,10 +4,11 @@ import os
 import json
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col, to_timestamp, current_timestamp
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType,BooleanType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType, BooleanType
+from pyspark.sql.functions import expr, lit, to_json, struct
 
 # --- CONFIGURATION ---
-KAFKA_BOOTSTRAP = "kafka:29092"  # Internal Docker network address
+KAFKA_BOOTSTRAP = "kafka:29092"
 TOPIC = "transactions"
 POSTGRES_URL = "jdbc:postgresql://postgres:5432/fraud_detection_db"
 POSTGRES_PROPERTIES = {
@@ -19,6 +20,9 @@ POSTGRES_PROPERTIES = {
 # R2 Configuration
 BUCKET_NAME = "sentinel"
 CHECKPOINT_DIR = "/tmp/spark-checkpoints/sentinel-fraud-detection"
+
+# Global variable to hold rules (initialized in main)
+ACTIVE_RULES = []
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +46,6 @@ def fetch_schema_from_db(spark, pipeline_id):
     '''
     Get the schema for the pipelines from the db
     '''
-    # We use a subquery to filter exactly what we need
     query = f"""
     (SELECT s.schema_json, p.kafka_topic 
      FROM schemas s 
@@ -50,7 +53,6 @@ def fetch_schema_from_db(spark, pipeline_id):
      WHERE p.id = {pipeline_id}) as config_alias
     """
     
-    # Read using the postgres jar already loaded in Spark
     config_df = spark.read.format("jdbc") \
         .option("url", POSTGRES_URL) \
         .option("dbtable", query) \
@@ -62,67 +64,104 @@ def fetch_schema_from_db(spark, pipeline_id):
     if config_df.isEmpty():
         raise ValueError(f"No pipeline found for ID {pipeline_id}")
     
-    # Collect the single row of config
     row = config_df.first()
-    
-    # Spark might read JSONB as a string, which is perfect for us
     return row["schema_json"], row["kafka_topic"]
+
+def fetch_rules_from_db(spark, pipeline_id):
+    query = f"""
+    (SELECT rule_expression, description, severity 
+     FROM rules 
+     WHERE pipeline_id = {pipeline_id}) as rules_alias
+    """
+    
+    rules_df = spark.read.format("jdbc") \
+        .option("url", POSTGRES_URL) \
+        .option("dbtable", query) \
+        .option("user", POSTGRES_PROPERTIES["user"]) \
+        .option("password", POSTGRES_PROPERTIES["password"]) \
+        .option("driver", POSTGRES_PROPERTIES["driver"]) \
+        .load()
+    
+    return [row.asDict() for row in rules_df.collect()]
 
 def process_batch(batch_df, batch_id):
     """
-    This function runs on every micro-batch (e.g., every 10 seconds).
-    It persists the data, runs two different analytics, and writes to Postgres.
+    Runs on every micro-batch. 
+    1. Archives raw data to R2 (Parquet).
+    2. Checks Dynamic Rules.
+    3. Writes alerts to Postgres (JSONB).
     """
     if batch_df.isEmpty():
-        logger.info(f"Batch {batch_id} is empty, skipping...")
         return
 
     logger.info(f"Processing Batch ID: {batch_id} with {batch_df.count()} records")
     
-    # Cache the batch because we will use it multiple times
     batch_df.cache()
 
     try:
         # --- LAYER 1: CLOUD ARCHIVING (R2) ---
-        logger.info(f"Archiving batch {batch_id} to R2...")
-        
-        batch_df.withColumn("date", col("timestamp").cast("date")) \
-            .write \
-            .mode("append") \
-            .partitionBy("date") \
-            .parquet(f"s3a://{BUCKET_NAME}/raw_transactions")
-            
-        logger.info(f"✅ Archived batch {batch_id} to R2 (s3a://{BUCKET_NAME}/raw_transactions)")
-
-        # --- LOGIC 1: DETECT FRAUD (Simple Rule Engine) ---
-        alerts_df = batch_df.filter(col("amount") > 5000)
-        
-        fraud_count = alerts_df.count()
-        if fraud_count > 0:
-            logger.warning(f"⚠️ Found {fraud_count} suspicious transactions in batch {batch_id}!")
-            
-            # Write to PostgreSQL
-            alerts_df.select("transaction_id", "user_id", "amount", "timestamp") \
+        if "timestamp" in batch_df.columns:
+            logger.info(f"Archiving batch {batch_id} to R2...")
+            batch_df.withColumn("date", col("timestamp").cast("date")) \
                 .write \
-                .jdbc(url=POSTGRES_URL, table="fraud_alerts", mode="append", properties=POSTGRES_PROPERTIES)
-            
-            logger.info(f"✅ Wrote {fraud_count} fraud alerts to PostgreSQL")
+                .mode("append") \
+                .partitionBy("date") \
+                .parquet(f"s3a://{BUCKET_NAME}/raw_transactions")
+            logger.info(f"✅ Archived batch to R2")
+        else:
+            logger.warning("⚠️ Skipping R2 Archival: Input data missing 'timestamp' column")
 
-        # --- LOGIC 2: AGGREGATE STATS (User Insights) ---
-        stats_df = batch_df.groupBy("user_id") \
-            .agg({"amount": "avg", "transaction_id": "count"}) \
-            .withColumnRenamed("avg(amount)", "avg_spend") \
-            .withColumnRenamed("count(transaction_id)", "txn_count")
+        # --- LAYER 2: DYNAMIC RULE ENGINE ---
+        all_alerts = None
         
-        stats_count = stats_df.count()
-        stats_df.write \
-            .jdbc(url=POSTGRES_URL, table="user_stats", mode="append", properties=POSTGRES_PROPERTIES)
-        
-        logger.info(f"✅ Wrote statistics for {stats_count} users to PostgreSQL")
+        for rule in ACTIVE_RULES:
+            violation_df = batch_df.filter(expr(rule['rule_expression']))
+
+            if violation_df.isEmpty():
+                continue
+            
+            tagged_df = violation_df \
+                .withColumn("rule_description", lit(rule['description'])) \
+                .withColumn("severity", lit(rule['severity'])) \
+                .withColumn("pipeline_id", lit(PIPELINE_ID))
+
+            if all_alerts is None:
+                all_alerts = tagged_df
+            else:
+                all_alerts = all_alerts.union(tagged_df)
+
+        # --- LAYER 3: WRITE ALERTS TO POSTGRES ---
+        if all_alerts:
+            # Pack all dynamic columns into JSON string
+            output_df = all_alerts.select(
+                col("pipeline_id"),
+                col("severity"),
+                col("rule_description"),
+                current_timestamp().alias("alert_timestamp"),
+                to_json(struct("*")).alias("transaction_data")
+            )
+            
+            count = output_df.count()
+            logger.warning(f"⚠️ Writing {count} alerts to DB")
+            
+            # FIX: Create a temporary view and use SQL CAST to convert string to JSONB
+            output_df.createOrReplaceTempView("alerts_temp")
+            
+            # Use Spark SQL to prepare data, then write with proper SQL statement
+            # Option 1: Register temp view and let PostgreSQL handle the cast
+            output_df.write \
+                .format("jdbc") \
+                .option("url", POSTGRES_URL) \
+                .option("dbtable", "fraud_alerts") \
+                .option("user", POSTGRES_PROPERTIES["user"]) \
+                .option("password", POSTGRES_PROPERTIES["password"]) \
+                .option("driver", POSTGRES_PROPERTIES["driver"]) \
+                .option("stringtype", "unspecified") \
+                .mode("append") \
+                .save()
 
     except Exception as e:
         logger.error(f"❌ Error processing batch {batch_id}: {str(e)}", exc_info=True)
-        # Don't raise - allow stream to continue
     finally:
         batch_df.unpersist()
         logger.info(f"Completed processing batch {batch_id}")
@@ -164,16 +203,19 @@ def main():
     # parse arguments to get the pipeline id
     parser = argparse.ArgumentParser()
     parser.add_argument("--pipeline-id", type=int, required=True, help="ID of the pipeline to run")
-    args = parser.parse_known_args()[0] # Use parse_known_args to avoid conflict with Spark args
+    args = parser.parse_known_args()[0]
+
+    global PIPELINE_ID 
+    PIPELINE_ID = args.pipeline_id
 
     # fetch the configuration dynamically
     logger.info(f"Fetching configuration for Pipeline ID: {args.pipeline_id}")
-    schema_json_str, kafka_topic = fetch_schema_from_db(spark,args.pipeline_id)
+    schema_json_str, kafka_topic = fetch_schema_from_db(spark, args.pipeline_id)
 
     # Parse the JSON string into a Python list
     schema_list = json.loads(schema_json_str)
 
-    # 3. Dynamically Build Spark Schema
+    # Dynamically Build Spark Schema
     fields = []
     for field in schema_list:
         s_field = StructField(
@@ -186,14 +228,10 @@ def main():
     dynamic_schema = StructType(fields)
     logger.info(f"✅ Dynamic Schema Built: {dynamic_schema.simpleString()}")
 
-    # # Define Schema matching Go Producer
-    # schema = StructType([
-    #     StructField("transaction_id", StringType(), True),
-    #     StructField("user_id", IntegerType(), True),
-    #     StructField("amount", FloatType(), True),
-    #     StructField("currency", StringType(), True),
-    #     StructField("timestamp", StringType(), True)
-    # ])
+    # Fetch Rules
+    global ACTIVE_RULES
+    ACTIVE_RULES = fetch_rules_from_db(spark, args.pipeline_id)
+    logger.info(f"Loaded {len(ACTIVE_RULES)} rules from database.")
 
     # Read Stream from Kafka
     logger.info(f"Starting Kafka Stream (topic: {kafka_topic}, bootstrap: {KAFKA_BOOTSTRAP})...")
@@ -207,12 +245,6 @@ def main():
         .load()
 
     logger.info("✅ Kafka stream connected")
-
-    # # Parse JSON
-    # parsed_df = kafka_df.select(
-    #     from_json(col("value").cast("string"), schema).alias("data")
-    # ).select("data.*") \
-    #  .withColumn("timestamp", to_timestamp(col("timestamp")))
 
     # Parse JSON using dynamic schema
     parsed_df = kafka_df.select(

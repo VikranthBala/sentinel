@@ -64,7 +64,7 @@ submit: ## Submit the Spark Streaming Job with R2 support
 		--conf spark.hadoop.fs.s3a.path.style.access=true \
 		--conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
 		--conf spark.hadoop.fs.s3a.connection.ssl.enabled=true \
-		/opt/spark-app/job.py --pipeline-id 1
+		/opt/spark-app/job.py --pipeline-id $(ID)
 
 producer: ## Run the Golang Transaction Producer
 	@echo "💸 Starting Transaction Generator..."
@@ -73,6 +73,10 @@ producer: ## Run the Golang Transaction Producer
 dashboard: ## Run the Textual TUI Dashboard
 	@echo "📊 Starting Dashboard..."
 	python3 src/dashboard/app.py
+
+server: # Run the config server
+	@echo "Starting server..."
+	cd src/config && uvicorn main:app --reload
 
 # --- MONITORING ---
 
