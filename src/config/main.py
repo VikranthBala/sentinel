@@ -95,3 +95,86 @@ def add_rule(id: int, rule: Rule):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+@app.get("/api/pipelines")
+def list_pipelines():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("""
+        SELECT p.id, p.name, p.kafka_topic, p.status, p.created_at,
+               COUNT(fa.id) as alert_count
+        FROM pipelines p
+        LEFT JOIN fraud_alerts fa ON fa.pipeline_id = p.id
+        GROUP BY p.id
+        ORDER BY p.created_at DESC
+    """)
+    pipelines = cursor.fetchall()
+    conn.close()
+    return pipelines
+
+@app.get("/api/pipelines/{id}")
+def get_pipeline(id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT * FROM pipelines WHERE id = %s", (id,))
+    pipeline = cursor.fetchone()
+    conn.close()
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    return pipeline
+
+@app.put("/api/pipelines/{id}")
+def update_pipeline(id: int, status: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE pipelines SET status = %s WHERE id = %s",
+        (status, id)
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "updated"}
+
+@app.get("/api/alerts")
+def list_alerts(pipeline_id: int = None, limit: int = 20):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    if pipeline_id:
+        cursor.execute("""
+            SELECT * FROM fraud_alerts 
+            WHERE pipeline_id = %s 
+            ORDER BY alert_timestamp DESC 
+            LIMIT %s
+        """, (pipeline_id, limit))
+    else:
+        cursor.execute("""
+            SELECT * FROM fraud_alerts 
+            ORDER BY alert_timestamp DESC 
+            LIMIT %s
+        """, (limit,))
+    
+    alerts = cursor.fetchall()
+    conn.close()
+    return alerts
+
+@app.get("/api/rules/{pipeline_id}")
+def get_rules(pipeline_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute(
+        "SELECT * FROM rules WHERE pipeline_id = %s",
+        (pipeline_id,)
+    )
+    rules = cursor.fetchall()
+    conn.close()
+    return rules
+
+@app.delete("/api/rules/{rule_id}")
+def delete_rule(rule_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM rules WHERE id = %s", (rule_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}

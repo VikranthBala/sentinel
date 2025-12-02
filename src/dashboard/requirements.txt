@@ -1,2 +1,6 @@
 textual
 psycopg2-binary
+streamlit 
+pandas 
+requests 
+plotly
