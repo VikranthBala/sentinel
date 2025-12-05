@@ -44,6 +44,7 @@ topic: ## Create the Kafka 'transactions' topic (Idempotent)
 
 db-shell: ## Connect to the Postgres shell inside Docker
 	docker exec -it $(DB_CONTAINER) psql -U admin -d fraud_detection_db
+# 	ALTER TABLE rules ADD COLUMN is_active BOOLEAN DEFAULT TRUE;
 
 db-init: ## Initialize database tables
 	@echo "🗄️  Initializing database schema..."
@@ -72,7 +73,7 @@ producer: ## Run the Golang Transaction Producer
 
 dashboard: ## Run the Textual TUI Dashboard
 	@echo "📊 Starting Dashboard..."
-	python3 src/dashboard/app.py
+	streamlit run src/dashboard/ui.py
 
 server: # Run the config server
 	@echo "Starting server..."

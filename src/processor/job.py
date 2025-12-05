@@ -21,9 +21,6 @@ POSTGRES_PROPERTIES = {
 BUCKET_NAME = "sentinel"
 CHECKPOINT_DIR = "/tmp/spark-checkpoints/sentinel-fraud-detection"
 
-# Global variable to hold rules (initialized in main)
-ACTIVE_RULES = []
-
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,59 +64,112 @@ def fetch_schema_from_db(spark, pipeline_id):
     row = config_df.first()
     return row["schema_json"], row["kafka_topic"]
 
-def fetch_rules_from_db(spark, pipeline_id):
-    query = f"""
+def get_pipeline_config(spark, pipeline_id):
+    """
+    Fetches both status and rules in one go to minimize DB hits.
+    """
+    # Check Pipeline Status
+    status_query = f"(SELECT status FROM pipelines WHERE id = {pipeline_id}) as status_alias"
+    status_df = spark.read.jdbc(url=POSTGRES_URL, table=status_query, properties=POSTGRES_PROPERTIES)
+    
+    if status_df.isEmpty():
+        return "inactive", []
+    
+    current_status = status_df.first()['status']
+    
+    # Check Active Rules
+    rules_query = f"""
     (SELECT rule_expression, description, severity 
      FROM rules 
-     WHERE pipeline_id = {pipeline_id}) as rules_alias
+     WHERE pipeline_id = {pipeline_id} AND is_active = TRUE) as rules_alias
     """
+    rules_df = spark.read.jdbc(url=POSTGRES_URL, table=rules_query, properties=POSTGRES_PROPERTIES)
+    rules = [row.asDict() for row in rules_df.collect()]
     
-    rules_df = spark.read.format("jdbc") \
-        .option("url", POSTGRES_URL) \
-        .option("dbtable", query) \
-        .option("user", POSTGRES_PROPERTIES["user"]) \
-        .option("password", POSTGRES_PROPERTIES["password"]) \
-        .option("driver", POSTGRES_PROPERTIES["driver"]) \
-        .load()
-    
-    return [row.asDict() for row in rules_df.collect()]
+    return current_status, rules
 
 def process_batch(batch_df, batch_id):
     """
     Runs on every micro-batch. 
-    1. Archives raw data to R2 (Parquet).
-    2. Checks Dynamic Rules.
-    3. Writes alerts to Postgres (JSONB).
+    1. Fetches latest Rules & Status from DB (Dynamic Updates).
+    2. Archives raw data to R2 (Always runs if data exists).
+    3. Checks Pipeline Status (If paused, skips logic).
+    4. Runs Dynamic Rules & Writes Alerts.
     """
     if batch_df.isEmpty():
         return
 
+    # Access the active SparkSession from the DataFrame
+    spark = batch_df.sparkSession
     logger.info(f"Processing Batch ID: {batch_id} with {batch_df.count()} records")
     
     batch_df.cache()
 
     try:
+        # --- LAYER 0: FETCH DYNAMIC CONFIGURATION ---
+        # We fetch this every batch to allow "hot reloading" of rules/status
+        
+        # A. Check Pipeline Status
+        status_query = f"(SELECT status FROM pipelines WHERE id = {PIPELINE_ID}) as status_alias"
+        status_df = spark.read.format("jdbc") \
+            .option("url", POSTGRES_URL) \
+            .option("dbtable", status_query) \
+            .option("user", POSTGRES_PROPERTIES["user"]) \
+            .option("password", POSTGRES_PROPERTIES["password"]) \
+            .option("driver", POSTGRES_PROPERTIES["driver"]) \
+            .load()
+            
+        # Default to 'inactive' if not found, otherwise get value
+        pipeline_status = status_df.first()['status'] if not status_df.isEmpty() else 'inactive'
+
+        # B. Fetch Only ACTIVE Rules
+        rules_query = f"""
+        (SELECT rule_expression, description, severity 
+         FROM rules 
+         WHERE pipeline_id = {PIPELINE_ID} AND is_active = TRUE) as rules_alias
+        """
+        rules_df = spark.read.format("jdbc") \
+            .option("url", POSTGRES_URL) \
+            .option("dbtable", rules_query) \
+            .option("user", POSTGRES_PROPERTIES["user"]) \
+            .option("password", POSTGRES_PROPERTIES["password"]) \
+            .option("driver", POSTGRES_PROPERTIES["driver"]) \
+            .load()
+            
+        active_rules = [row.asDict() for row in rules_df.collect()]
+
         # --- LAYER 1: CLOUD ARCHIVING (R2) ---
+        # We always archive data, even if the pipeline logic is paused, to prevent data loss.
         if "timestamp" in batch_df.columns:
-            logger.info(f"Archiving batch {batch_id} to R2...")
+            # logger.info(f"Archiving batch {batch_id} to R2...")
             batch_df.withColumn("date", col("timestamp").cast("date")) \
                 .write \
                 .mode("append") \
                 .partitionBy("date") \
                 .parquet(f"s3a://{BUCKET_NAME}/raw_transactions")
-            logger.info(f"✅ Archived batch to R2")
         else:
             logger.warning("⚠️ Skipping R2 Archival: Input data missing 'timestamp' column")
 
-        # --- LAYER 2: DYNAMIC RULE ENGINE ---
+        # --- LAYER 2: LOGIC GATE ---
+        if pipeline_status != 'active':
+            logger.warning(f"🛑 Pipeline {PIPELINE_ID} is PAUSED. Skipping Rule Engine.")
+            return
+
+        if not active_rules:
+            logger.info(f"No active rules found for Pipeline {PIPELINE_ID}.")
+            return
+
+        # --- LAYER 3: DYNAMIC RULE ENGINE ---
         all_alerts = None
         
-        for rule in ACTIVE_RULES:
+        for rule in active_rules:
+            # Apply the SQL expression from the DB
             violation_df = batch_df.filter(expr(rule['rule_expression']))
 
             if violation_df.isEmpty():
                 continue
             
+            # Tag the data with rule metadata
             tagged_df = violation_df \
                 .withColumn("rule_description", lit(rule['description'])) \
                 .withColumn("severity", lit(rule['severity'])) \
@@ -130,9 +180,9 @@ def process_batch(batch_df, batch_id):
             else:
                 all_alerts = all_alerts.union(tagged_df)
 
-        # --- LAYER 3: WRITE ALERTS TO POSTGRES ---
+        # --- LAYER 4: WRITE ALERTS TO POSTGRES ---
         if all_alerts:
-            # Pack all dynamic columns into JSON string
+            # Pack all dynamic columns into JSON string for the 'transaction_data' column
             output_df = all_alerts.select(
                 col("pipeline_id"),
                 col("severity"),
@@ -142,13 +192,10 @@ def process_batch(batch_df, batch_id):
             )
             
             count = output_df.count()
-            logger.warning(f"⚠️ Writing {count} alerts to DB")
+            logger.warning(f"🚨 Detected {count} anomalies! Writing to DB...")
             
-            # FIX: Create a temporary view and use SQL CAST to convert string to JSONB
-            output_df.createOrReplaceTempView("alerts_temp")
-            
-            # Use Spark SQL to prepare data, then write with proper SQL statement
-            # Option 1: Register temp view and let PostgreSQL handle the cast
+            # Create a temporary view to allow JDBC write
+            output_df.createOrReplaceTempView("alerts_temp")            
             output_df.write \
                 .format("jdbc") \
                 .option("url", POSTGRES_URL) \
@@ -163,24 +210,21 @@ def process_batch(batch_df, batch_id):
     except Exception as e:
         logger.error(f"❌ Error processing batch {batch_id}: {str(e)}", exc_info=True)
     finally:
+        # Clear cache to free memory
         batch_df.unpersist()
-        logger.info(f"Completed processing batch {batch_id}")
 
 def main():
-    # Get R2 credentials from environment
+    # 1. SETUP: Get R2 credentials from environment
     aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
     aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
     s3_endpoint = os.getenv("S3_ENDPOINT")
 
-    # Validate credentials
     if not all([aws_access_key, aws_secret_key, s3_endpoint]):
-        raise ValueError(
-            "Missing R2 credentials! Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and S3_ENDPOINT"
-        )
+        raise ValueError("Missing R2 credentials! Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and S3_ENDPOINT")
 
     logger.info(f"Initializing Spark with R2 endpoint: {s3_endpoint}")
 
-    # Create Spark Session with all required dependencies
+    # 2. SPARK SESSION
     spark = SparkSession.builder \
         .appName("SentinelFraudEngine") \
         .config("spark.jars.packages", 
@@ -200,22 +244,22 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
     logger.info("✅ Spark Session created successfully")
 
-    # parse arguments to get the pipeline id
+    # 3. ARGS PARSING
     parser = argparse.ArgumentParser()
     parser.add_argument("--pipeline-id", type=int, required=True, help="ID of the pipeline to run")
     args = parser.parse_known_args()[0]
 
+    # IMPORTANT: We still need this global so process_batch can access it
     global PIPELINE_ID 
     PIPELINE_ID = args.pipeline_id
 
-    # fetch the configuration dynamically
+    # 4. FETCH SCHEMA (Static Configuration)
+    # This remains in main() because schema changes require a job restart
     logger.info(f"Fetching configuration for Pipeline ID: {args.pipeline_id}")
     schema_json_str, kafka_topic = fetch_schema_from_db(spark, args.pipeline_id)
 
-    # Parse the JSON string into a Python list
     schema_list = json.loads(schema_json_str)
 
-    # Dynamically Build Spark Schema
     fields = []
     for field in schema_list:
         s_field = StructField(
@@ -228,12 +272,11 @@ def main():
     dynamic_schema = StructType(fields)
     logger.info(f"✅ Dynamic Schema Built: {dynamic_schema.simpleString()}")
 
-    # Fetch Rules
-    global ACTIVE_RULES
-    ACTIVE_RULES = fetch_rules_from_db(spark, args.pipeline_id)
-    logger.info(f"Loaded {len(ACTIVE_RULES)} rules from database.")
+    # ---------------------------------------------------------
+    # DELETED: fetch_rules_from_db call (Moved to process_batch)
+    # ---------------------------------------------------------
 
-    # Read Stream from Kafka
+    # 5. KAFKA STREAM SETUP
     logger.info(f"Starting Kafka Stream (topic: {kafka_topic}, bootstrap: {KAFKA_BOOTSTRAP})...")
 
     kafka_df = spark.readStream \
@@ -244,20 +287,18 @@ def main():
         .option("failOnDataLoss", "false") \
         .load()
 
-    logger.info("✅ Kafka stream connected")
-
-    # Parse JSON using dynamic schema
+    # 6. PARSE JSON
     parsed_df = kafka_df.select(
         from_json(col("value").cast("string"), dynamic_schema).alias("data")
     ).select("data.*")
 
-    logger.info("Starting structured streaming query with 10-second micro-batches...")
-
-    # If your schema has a timestamp field, handle the cast specifically
+    # Timestamp casting for Windowing/Watermarking if needed later
     if "timestamp" in parsed_df.columns:
         parsed_df = parsed_df.withColumn("timestamp", to_timestamp(col("timestamp")))
 
-    # Start Processing with Checkpointing
+    # 7. START STREAM
+    logger.info("Starting structured streaming query with 10-second micro-batches...")
+    
     query = parsed_df.writeStream \
         .foreachBatch(process_batch) \
         .trigger(processingTime="10 seconds") \
@@ -265,8 +306,6 @@ def main():
         .start()
 
     logger.info(f"✅ Streaming query started (checkpoint: {CHECKPOINT_DIR})")
-    logger.info("Press Ctrl+C to stop the application")
-
     query.awaitTermination()
 
 if __name__ == "__main__":

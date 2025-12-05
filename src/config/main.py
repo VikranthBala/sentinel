@@ -17,6 +17,12 @@ DB_CONFIG = {
     "port": "5432"
 }
 
+class RuleToggle(BaseModel):
+    is_active: bool
+
+class PipelineStatus(BaseModel):
+    status: str # "active" or "paused"
+
 class SchemaField(BaseModel):
     name: str
     type: str  # "string", "integer", "float", "timestamp"
@@ -83,8 +89,9 @@ def add_rule(id: int, rule: Rule):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # Added is_active to INSERT
         cursor.execute(
-            "INSERT INTO rules (pipeline_id, rule_expression, severity, description) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO rules (pipeline_id, rule_expression, severity, description, is_active) VALUES (%s, %s, %s, %s, TRUE) RETURNING id",
             (id, rule.rule_expression, rule.severity, rule.description)
         )
         rule_id = cursor.fetchone()[0]
@@ -135,6 +142,26 @@ def update_pipeline(id: int, status: str):
     conn.close()
     return {"status": "updated"}
 
+# 3. Update Pipeline Status (Pause/Resume)
+@app.patch("/api/pipelines/{id}/status")
+def update_pipeline_status(id: int, status: PipelineStatus):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE pipelines SET status = %s WHERE id = %s", (status.status, id))
+    conn.commit()
+    conn.close()
+    return {"message": f"Pipeline is now {status.status}"}
+
+# 4. Get Pipeline Status (For Spark Job to check)
+@app.get("/api/pipelines/{id}/status")
+def get_pipeline_status(id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT status FROM pipelines WHERE id = %s", (id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
 @app.get("/api/alerts")
 def list_alerts(pipeline_id: int = None, limit: int = 20):
     conn = get_db_connection()
@@ -169,6 +196,15 @@ def get_rules(pipeline_id: int):
     rules = cursor.fetchall()
     conn.close()
     return rules
+
+@app.patch("/api/rules/{rule_id}/status")
+def toggle_rule(rule_id: int, status: RuleToggle):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE rules SET is_active = %s WHERE id = %s", (status.is_active, rule_id))
+    conn.commit()
+    conn.close()
+    return {"message": "Rule status updated"}
 
 @app.delete("/api/rules/{rule_id}")
 def delete_rule(rule_id: int):

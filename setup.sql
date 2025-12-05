@@ -29,7 +29,8 @@ CREATE TABLE rules (
     rule_expression TEXT NOT NULL,  -- e.g. "amount > 5000 AND currency = 'USD'"
     severity VARCHAR(50) DEFAULT 'warning',
     description TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE
 );
 CREATE TABLE fraud_alerts (
     id SERIAL PRIMARY KEY,

@@ -14,6 +14,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# --- SESSION STATE INITIALIZATION ---
+if 'rule_states' not in st.session_state:
+    st.session_state.rule_states = {}
+
 # --- API HELPER FUNCTIONS ---
 def get_pipelines():
     try:
@@ -35,6 +39,34 @@ def create_pipeline(data):
 def add_rule(pipeline_id, data):
     return requests.post(f"{API_URL}/pipelines/{pipeline_id}/rules", json=data)
 
+def toggle_pipeline_status(p_id, new_status):
+    try:
+        requests.patch(f"{API_URL}/pipelines/{p_id}/status", json={"status": new_status})
+        return True
+    except:
+        return False
+
+def toggle_rule_status(rule_id, is_active):
+    try:
+        requests.patch(f"{API_URL}/rules/{rule_id}/status", json={"is_active": is_active})
+        return True
+    except:
+        return False
+
+def delete_rule_api(rule_id):
+    try:
+        requests.delete(f"{API_URL}/rules/{rule_id}")
+        return True
+    except:
+        return False
+
+def delete_pipeline_api(pipeline_id):
+    try:
+        requests.delete(f"{API_URL}/pipelines/{pipeline_id}")
+        return True
+    except:
+        return False
+
 # --- SIDEBAR NAVIGATION ---
 st.sidebar.title("🛡️ Sentinel")
 page = st.sidebar.radio("Navigation", ["Dashboard", "Pipeline Manager", "Rule Engine"])
@@ -52,7 +84,7 @@ if page == "Dashboard":
     alerts = get_alerts(100)
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("Active Pipelines", len(pipelines))
+    col1.metric("Active Pipelines", len([p for p in pipelines if p['status'] == 'active']))
     col2.metric("Total Alerts (Last 100)", len(alerts))
     
     # Calculate Severity Ratio
@@ -99,8 +131,40 @@ elif page == "Pipeline Manager":
     with tab1:
         pipelines = get_pipelines()
         if pipelines:
-            df = pd.DataFrame(pipelines)
-            st.dataframe(df, use_container_width=True)
+            for pipeline in pipelines:
+                with st.container():
+                    col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
+                    
+                    col1.markdown(f"**{pipeline['name']}**")
+                    col1.caption(f"Topic: `{pipeline['kafka_topic']}`")
+                    
+                    # Status badge
+                    status = pipeline['status']
+                    status_color = "🟢" if status == "active" else "🟡" if status == "paused" else "🔴"
+                    col2.markdown(f"{status_color} **{status.upper()}**")
+                    col2.caption(f"Created: {pipeline['created_at'][:10]}")
+                    
+                    # Toggle Pipeline
+                    if status == 'active':
+                        if col3.button("⏸️ Pause", key=f"pause_p_{pipeline['id']}"):
+                            if toggle_pipeline_status(pipeline['id'], "paused"):
+                                st.success("Paused!")
+                                st.rerun()
+                    else:
+                        if col3.button("▶️ Resume", key=f"resume_p_{pipeline['id']}"):
+                            if toggle_pipeline_status(pipeline['id'], "active"):
+                                st.success("Resumed!")
+                                st.rerun()
+                    
+                    # Delete Pipeline
+                    if col4.button("🗑️", key=f"del_p_{pipeline['id']}"):
+                        if delete_pipeline_api(pipeline['id']):
+                            st.success("Deleted!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete")
+                    
+                    st.divider()
         else:
             st.warning("No pipelines found.")
 
@@ -148,6 +212,7 @@ elif page == "Pipeline Manager":
                     res = create_pipeline(payload)
                     if res.status_code == 200:
                         st.success(f"Pipeline created! ID: {res.json()['id']}")
+                        st.rerun()
                     else:
                         st.error(f"Error: {res.text}")
                 else:
@@ -155,44 +220,126 @@ elif page == "Pipeline Manager":
 
 # --- PAGE: RULE ENGINE ---
 elif page == "Rule Engine":
-    st.title("⚡ Dynamic Rule Engine")
+    st.title("⚡ Pipeline Logic & Controls")
     
     pipelines = get_pipelines()
-    if not pipelines:
-        st.error("Create a pipeline first.")
-    else:
-        # Create a mapping of Name -> ID
-        p_map = {p['name']: p['id'] for p in pipelines}
-        selected_p_name = st.selectbox("Select Target Pipeline", list(p_map.keys()))
-        selected_p_id = p_map[selected_p_name]
-        
-        # Fetch Schema to help the user write rules
-        try:
-            schema_res = requests.get(f"{API_URL}/pipelines/{selected_p_id}/schema")
-            if schema_res.status_code == 200:
-                schema_fields = [f['name'] for f in schema_res.json()]
-                st.info(f"Available Fields for Logic: {', '.join(schema_fields)}")
-        except:
-            pass
+    if pipelines:
+        p_map = {p['name']: p for p in pipelines}
+        selected_p_name = st.selectbox("Select Pipeline", list(p_map.keys()))
+        selected_p = p_map[selected_p_name]
+        p_id = selected_p['id']
 
-        st.subheader("Add New Detection Rule")
-        with st.form("rule_form"):
-            desc = st.text_input("Rule Description", placeholder="High Value Transaction")
+        # --- SECTION 1: PIPELINE CONTROLS ---
+        st.subheader(f"Manage: {selected_p_name}")
+        
+        col_stat, col_date, col_action = st.columns(3)
+        status = selected_p['status']
+        status_emoji = "🟢" if status == 'active' else "🟡" if status == 'paused' else "🔴"
+        col_stat.metric("Current Status", f"{status_emoji} {status.upper()}")
+        col_date.caption(f"Created: {selected_p['created_at']}")
+        
+        # Pause/Resume Button
+        if status == 'active':
+            if col_action.button("⏸️ Pause Pipeline", key="pause_pipeline"):
+                if toggle_pipeline_status(p_id, "paused"):
+                    st.success("Pipeline paused!")
+                    st.rerun()
+        else:
+            if col_action.button("▶️ Resume Pipeline", key="resume_pipeline"):
+                if toggle_pipeline_status(p_id, "active"):
+                    st.success("Pipeline resumed!")
+                    st.rerun()
+
+        st.divider()
+
+        # --- SECTION 2: RULES LIST ---
+        st.subheader("Active Rules")
+        
+        try:
+            rules = requests.get(f"{API_URL}/rules/{p_id}").json()
+        except:
+            rules = []
+        
+        if rules:
+            # Initialize rule states if not present
+            for rule in rules:
+                rule_id = rule['id']
+                if rule_id not in st.session_state.rule_states:
+                    st.session_state.rule_states[rule_id] = rule.get('is_active', True)
             
-            col1, col2 = st.columns([3, 1])
-            expr = col1.text_input("SQL Expression", placeholder="amount > 10000 AND currency = 'USD'")
-            severity = col2.selectbox("Severity", ["info", "warning", "critical"])
-            
-            submit_rule = st.form_submit_button("Add Rule")
-            
-            if submit_rule:
-                payload = {
-                    "rule_expression": expr,
-                    "severity": severity,
-                    "description": desc
-                }
-                res = add_rule(selected_p_id, payload)
-                if res.status_code == 200:
-                    st.success("Rule added successfully! It will be applied to the next micro-batch.")
-                else:
-                    st.error(res.text)
+            for rule in rules:
+                rule_id = rule['id']
+                
+                with st.container():
+                    c1, c2, c3, c4 = st.columns([4, 2, 1, 1])
+                    
+                    c1.markdown(f"**{rule['description']}**")
+                    c1.code(rule['rule_expression'], language='sql')
+                    
+                    severity_emoji = "🔴" if rule['severity'] == 'critical' else "🟡" if rule['severity'] == 'warning' else "🔵"
+                    c2.markdown(f"{severity_emoji} **{rule['severity'].upper()}**")
+                    
+                    # Toggle Switch - Use callback to prevent multiple calls
+                    def toggle_callback(rule_id=rule_id):
+                        new_state = st.session_state[f"toggle_{rule_id}"]
+                        if toggle_rule_status(rule_id, new_state):
+                            st.session_state.rule_states[rule_id] = new_state
+                    
+                    c3.toggle(
+                        "Enabled",
+                        value=st.session_state.rule_states[rule_id],
+                        key=f"toggle_{rule_id}",
+                        on_change=toggle_callback
+                    )
+                    
+                    # Delete Button
+                    if c4.button("🗑️", key=f"del_{rule_id}"):
+                        if delete_rule_api(rule_id):
+                            if rule_id in st.session_state.rule_states:
+                                del st.session_state.rule_states[rule_id]
+                            st.success("Rule deleted!")
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete")
+                    
+                    st.markdown("---")
+        else:
+            st.info("No rules defined yet.")
+        
+        # --- SECTION 3: ADD NEW RULE ---
+        with st.expander("➕ Add New Rule"):
+            # Fetch Schema to help the user write rules
+            try:
+                schema_res = requests.get(f"{API_URL}/pipelines/{p_id}/schema")
+                if schema_res.status_code == 200:
+                    schema_fields = [f['name'] for f in schema_res.json()]
+                    st.info(f"📋 Available Fields: `{', '.join(schema_fields)}`")
+            except:
+                pass
+
+            with st.form("rule_form"):
+                desc = st.text_input("Rule Description", placeholder="High Value Transaction")
+                
+                col1, col2 = st.columns([3, 1])
+                expr = col1.text_input("SQL Expression", placeholder="amount > 10000 AND currency = 'USD'")
+                severity = col2.selectbox("Severity", ["info", "warning", "critical"])
+                
+                submit_rule = st.form_submit_button("✅ Add Rule")
+                
+                if submit_rule:
+                    if desc and expr:
+                        payload = {
+                            "rule_expression": expr,
+                            "severity": severity,
+                            "description": desc
+                        }
+                        res = add_rule(p_id, payload)
+                        if res.status_code == 200:
+                            st.success("Rule added successfully! It will be applied to the next micro-batch.")
+                            st.rerun()
+                        else:
+                            st.error(f"Error: {res.text}")
+                    else:
+                        st.error("Please fill in description and expression")
+    else:
+        st.warning("No pipelines found. Create one first in the Pipeline Manager.")
