@@ -58,6 +58,7 @@ services:
     volumes:
       - ./../../src/processor:/opt/spark-app
       - spark-checkpoints:/tmp/spark-checkpoints  # For fault tolerance
+      - spark-ivy-cache:/root/.ivy2
 
   spark-worker:
     image: apache/spark:3.5.0
@@ -109,3 +110,4 @@ services:
 volumes:
   postgres_data:
   spark-checkpoints:  # New volume for checkpointing
+  spark-ivy-cache:
